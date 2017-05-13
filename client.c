@@ -6,15 +6,33 @@
 #include <sys/types.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <time.h>
-#include<fcntl.h>
+#include <fcntl.h>
 #include "ThreadStructs.h"
 
-#define DEBUG 0
+#define COLOR_RED     "\x1b[31m"
+#define COLOR_GREEN   "\x1b[32m"
+#define COLOR_YELLOW  "\x1b[33m"
+#define COLOR_BLUE    "\x1b[34m"
+#define COLOR_MAGENTA "\x1b[35m"
+#define COLOR_CYAN    "\x1b[36m"
+#define COLOR_RESET   "\x1b[0m"
+
+#define EXECUTABLE_NAME "client.out"
+#define NO_OF_HOPS   30
+#define TIMEOUT_DELAY 20
+
+#define DEBUG 1
 #define CHARBUFFER 32
 #define FILEBUFFER 1024
 
+
+/*Reads Command line arguments and stores them in a clArgs(CMDARGS) struct*/
+void ReadArgs(int argc, char* argv[], CMDARGS_T args);
+/*Prints the correct syntax of the command line arguments*/
+void PrintSyntax();
 /*Reads end_servers.txt and returns user selected endServerDomain*/
 char *ReadServers(char* sourceFile, char *userAlias);
 /*Reads relay_nodes.txt and returns number of relay_nodes*/
@@ -35,6 +53,7 @@ void *DownloadFile(void *downArgs);
 void *DownloadRelay(void *downRArgs);
 
 int main(int argc, char* argv[]) {
+    CMDARGS_T cmdArgs = NULL;    
     pthread_t *comTid = NULL;
     pthread_t *relayPingTid = NULL;
     pthread_t *relayTraceTid = NULL;
@@ -58,7 +77,11 @@ int main(int argc, char* argv[]) {
     char **relayAlias = NULL;
     char **relayIP = NULL;
     char **relayPort = NULL;
-    int relaySize = 0;    
+    int relaySize = 0;
+    char *endServersFile = NULL;
+    char *relayNodesFile = NULL;
+    char *hopsArg = NULL;
+    char *timeoutArg = NULL;
     
     float *transferAvgRTT = NULL;
     int *transferHops = NULL;
@@ -82,11 +105,23 @@ int main(int argc, char* argv[]) {
     char url[5*CHARBUFFER]  = {'8'};
     int i = 0; int j = 0;
     
-    /*Check arguments*/
-    if (argc < 2) {
-        printf("Not enough arguments\n");
-        exit(-1);
-    }
+    
+    cmdArgs = malloc(sizeof(CMDARGS_S));	
+    /*Read & Check arguments*/
+    ReadArgs(argc, argv, cmdArgs);
+    
+    sprintf(word, "%s", cmdArgs->endServers);
+    endServersFile = malloc(strlen(word)*sizeof(char)+1);
+    strcpy(endServersFile, word);
+    sprintf(word, "%s", cmdArgs->relayNodes);
+    relayNodesFile = malloc(strlen(word)*sizeof(char)+1);
+    strcpy(relayNodesFile, word);
+    sprintf(word, "%d", cmdArgs->hops);
+    hopsArg = malloc(strlen(word)*sizeof(char)+1);
+    strcpy(hopsArg, word);
+    sprintf(word, "%d", cmdArgs->timeout);
+    timeoutArg = malloc(strlen(word)*sizeof(char)+1);
+    strcpy(timeoutArg, word);
     
     /*Take user input*/
     printf("Give input: SERVERALIAS NUMPING CRITERION\n");
@@ -99,15 +134,25 @@ int main(int argc, char* argv[]) {
     strcpy(userAlias, word);
     strcpy(word, strtok(NULL, " \r\n"));
     numPing = malloc(strlen(word)*sizeof(char) + 1);
-    strcpy(numPing, word);
+    strcpy(numPing, word);    
     strcpy(word, strtok(NULL, " \r\n"));
     criterion = malloc(strlen(word)*sizeof(char) + 1);
     strcpy(criterion, word);
+    for (i = 0; i < strlen(numPing); i++) {
+        if (isdigit(numPing[i] == 0)) {
+            printf("Wrong NUMPING\n");
+            exit(-1);
+        }
+    }
+    if ((strcmp(criterion, "latency") != 0) && (strcmp(criterion, "hops") != 0)) {
+        printf("Wrong CRITERION\n");
+        exit(-1);
+    }
 #if DEBUG
     printf("%s, %s, %s\n", userAlias, numPing, criterion);
 #endif
     /*Save end_Server Domain and Alias*/
-    endServerDomain = ReadServers(argv[1], userAlias);
+    endServerDomain = ReadServers(endServersFile, userAlias);
     endServerAlias = userAlias;
 #if DEBUG    
     printf("endServerAlias=%s\n", endServerAlias);
@@ -115,7 +160,7 @@ int main(int argc, char* argv[]) {
 #endif
     
     /*Save relay_Servers Alias, IP, Port*/
-    relaySize = ReadRelays(argv[2], &relayAlias, &relayIP, &relayPort);
+    relaySize = ReadRelays(relayNodesFile, &relayAlias, &relayIP, &relayPort);
 #if DEBUG
     printf("RelaySize=%d\n", relaySize);
 
@@ -138,6 +183,8 @@ int main(int argc, char* argv[]) {
     for (i = 0; i < relaySize; i++) {        
         comArgs[i].endServerDomain = endServerDomain;
         comArgs[i].numPing = numPing;
+        comArgs[i].hops = hopsArg;
+        comArgs[i].timeout = timeoutArg;
         comArgs[i].relayIP = relayIP[i];
         comArgs[i].relayPort = relayPort[i];
         comArgs[i].relayServerAvgRTT = &(transferAvgRTT[i]);
@@ -168,6 +215,7 @@ int main(int argc, char* argv[]) {
     endPingArgs->resAvgRTT = &endServerAvgRTT;
     endPingArgs->address = endServerDomain;
     endPingArgs->numPing = numPing;
+    endPingArgs->timeout = timeoutArg;
     endPingTid = malloc(sizeof(pthread_t));
     err = pthread_create(endPingTid, NULL, &Ping, endPingArgs);
     if (err != 0) {
@@ -181,6 +229,8 @@ int main(int argc, char* argv[]) {
     endTraceArgs = malloc(sizeof(TRACEARGS_S));
     endTraceArgs->resHops = &endServerHops;
     endTraceArgs->address = endServerDomain;
+    endTraceArgs->hops = hopsArg;
+    endTraceArgs->timeout = timeoutArg;
     endTraceTid = malloc(sizeof(pthread_t));
     err = pthread_create(endTraceTid, NULL, &Traceroute, endTraceArgs);
     if (err != 0) {
@@ -208,6 +258,7 @@ int main(int argc, char* argv[]) {
 #endif
         /*relayServer ping thread*/
         relayPingArgs[i].numPing = numPing;
+        relayPingArgs[i].timeout = timeoutArg;
         relayPingArgs[i].address = relayIP[i];
         relayPingArgs[i].resAvgRTT = &(relayAvgRTT[i]);
         err = pthread_create(&(relayPingTid[i]), NULL, &Ping, &(relayPingArgs[i]));
@@ -219,6 +270,8 @@ int main(int argc, char* argv[]) {
         
         /*relayServer trace thread*/
         relayTraceArgs[i].address = relayIP[i];
+        relayTraceArgs[i].hops = hopsArg;
+        relayTraceArgs[i].timeout = timeoutArg;
         relayTraceArgs[i].resHops = &(relayHops[i]);        
         err = pthread_create(&(relayTraceTid[i]), NULL, &Traceroute, &(relayTraceArgs[i]));
         if (err != 0) {
@@ -274,15 +327,15 @@ int main(int argc, char* argv[]) {
     
     /*Select downloadIndex via user choice*/
     if ((strcmp(criterion, "latency") == 0) && (tieAvgRTT == 0)) {
-        if (tieHops == 1) printf("TIE on HOPS CRITERION");
+        if (tieHops == 1) printf("TIE on HOPS CRITERION\n");
         printf("Selecting best route via LATENCY\n");
         downloadIndex = avgRTTIndex;
     } else if ((strcmp(criterion, "hops") == 0) && (tieHops == 0)) {
-        if (tieAvgRTT == 1) printf("TIE on LATENCY CRITERION");
+        if (tieAvgRTT == 1) printf("TIE on LATENCY CRITERION\n");
         printf("Selecting best route via HOPS\n");
         downloadIndex = hopsIndex;
     } else {
-        printf("TIE on BOTH CRITERIA");
+        printf("TIE on BOTH CRITERIA\n");
         printf("Selecting best route via RANDOM CRITERION\n");
         srand((unsigned) time(&t));
         if ((rand() % 2) == 0) {
@@ -293,7 +346,7 @@ int main(int argc, char* argv[]) {
             printf("Selecting best route via HOPS\n");
         }
     }
-    downloadIndex = -1; /*DEBUG*/
+    downloadIndex = 1; /*DEBUG*/
 #if DEBUG
     printf("downloadIndex=%d\n", downloadIndex);
 #endif
@@ -319,6 +372,7 @@ int main(int argc, char* argv[]) {
         downArgs->relayIP = NULL;
         downArgs->relayPort = NULL;
         downArgs->url = downloadURL;
+        downArgs->timeout = timeoutArg;
         downArgs->downTime = &downTime;
         downTid = malloc(sizeof (pthread_t));
         err = pthread_create(downTid, NULL, &DownloadFile, downArgs);
@@ -335,6 +389,7 @@ int main(int argc, char* argv[]) {
         downArgs->relayIP = relayIP[downloadIndex];
         downArgs->relayPort = relayPort[downloadIndex];
         downArgs->url = downloadURL;
+        downArgs->timeout = timeoutArg;
         downArgs->downTime = &downTime;
         downTid = malloc(sizeof (pthread_t));
         err = pthread_create(downTid, NULL, &DownloadRelay, downArgs);
@@ -348,6 +403,11 @@ int main(int argc, char* argv[]) {
     }
     
     /*Free*/
+    free(cmdArgs); cmdArgs = NULL;
+    free(endServersFile); endServersFile = NULL;
+    free(relayNodesFile); relayNodesFile = NULL;
+    free(hopsArg); hopsArg = NULL;
+    free(timeoutArg); timeoutArg = NULL;
     free(userAlias); userAlias = NULL;
     free(numPing); numPing = NULL;
     free(criterion); criterion = NULL;
@@ -380,6 +440,92 @@ int main(int argc, char* argv[]) {
     
     /*system("PAUSE");*/
     return 0;
+}
+/*Reads Command line arguments and stores them in a clArgs(CMDARGS) struct*/
+void ReadArgs(int argc, char* argv[], CMDARGS_T args) {
+    int i;
+    int failed = 0;
+    FILE *file;
+
+    if (argc < 5) {
+        printf(COLOR_RED "ERROR: " COLOR_YELLOW "Too few command line arguments!\n" COLOR_RESET);
+        failed++;
+    }
+
+    args->hops = NO_OF_HOPS;
+    args->timeout = TIMEOUT_DELAY;
+    args->endServers[0] = '\0';
+    args->relayNodes[0] = '\0';
+
+    for (i = 1; i < argc; i = i + 2) {
+        if (*argv[i] != '-') {
+            printf(COLOR_RED "ERROR: " COLOR_YELLOW "Invalid argument \"%s %s\"\n" COLOR_RESET, argv[i], argv[i + 1]);
+            failed++;
+        }
+        switch (*(argv[i] + 1)) {
+            case 'e':
+                strncpy(args->endServers, argv[i + 1], strlen(argv[i + 1]) + 1);
+                break;
+            case 'r':
+                strncpy(args->relayNodes, argv[i + 1], strlen(argv[i + 1]) + 1);
+                break;
+            case 'h':
+                args->hops = atoi(argv[i + 1]);
+                break;
+            case 'w':
+                args->timeout = atoi(argv[i + 1]);
+                break;
+            default:
+                printf(COLOR_RED "ERROR: " COLOR_YELLOW "Invalid argument \"%s %s\"\n" COLOR_RESET, argv[i], argv[i + 1]);
+                failed++;
+        }
+    }
+    if (args->endServers[0] == '\0') {
+        printf(COLOR_RED "ERROR: " COLOR_YELLOW "Missing argument: End Servers File\n" COLOR_RESET, argv[i], argv[i + 1]);
+        failed++;
+    }
+    if (args->relayNodes[0] == '\0') {
+        printf(COLOR_RED "ERROR: " COLOR_YELLOW "Missing argument: Relay Nodes File\n" COLOR_RESET, argv[i], argv[i + 1]);
+        failed++;
+    }
+
+    file = fopen(args->endServers, "r");
+    if (file) {
+        fclose(file);
+    } else {
+        printf(COLOR_RED "ERROR: " COLOR_YELLOW "Cannot open End Servers File\n" COLOR_RESET);
+        failed++;
+    }
+    file = fopen(args->relayNodes, "r");
+    if (file) {
+        fclose(file);
+    } else {
+        printf(COLOR_RED "ERROR: " COLOR_YELLOW "Cannot open Relay Nodes File\n" COLOR_RESET);
+        failed++;
+    }
+
+    if (args->hops < 1) {
+        printf(COLOR_RED "ERROR: " COLOR_YELLOW "Invalid Max Hops\n" COLOR_RESET);
+        failed++;
+    }
+
+    if (args->timeout < 1) {
+        printf(COLOR_RED "ERROR: " COLOR_YELLOW "Invalid timeout delay\n" COLOR_RESET);
+        failed++;
+    }
+
+    if (failed) {
+        PrintSyntax();
+        exit(-1);
+    }
+}
+
+/*Prints the correct syntax of the command line arguments*/
+void PrintSyntax() {
+    char exec[] = EXECUTABLE_NAME;
+    printf("Correct syntax is:\t %s (-e <end servers filename>) (-r <relay nodes filename>) [-h <Max number of hops>] [-w <timeout delay>]\n", exec);
+    printf("Arguments in \'()\' are mandatory, arguments in \'[]\' are optional.\n");
+    printf("(Default max number of hops: %d. Default timeout delay: %d sec)\n", NO_OF_HOPS, TIMEOUT_DELAY);
 }
 
 /*Reads end_servers.txt and returns user selected end_server*/
@@ -550,6 +696,8 @@ void *CommunicateRelay(void *comArgs) {
     COMMUNICATIONARGS_T args = (COMMUNICATIONARGS_T)comArgs;
     char *endServerDomain = args->endServerDomain;
     char *numPing = args->numPing;
+    char *timeout = args->timeout;
+    char *maxHops = args->hops;
     char *relayIP = args->relayIP;
     char *relayPort = args->relayPort;
     float *relayServerAvgRTT = args->relayServerAvgRTT;
@@ -562,6 +710,10 @@ void *CommunicateRelay(void *comArgs) {
         strcat(recvBuf, endServerDomain);
         strcat(recvBuf, " ");
         strcat(recvBuf, numPing);
+        strcat(recvBuf, " ");
+        strcat(recvBuf, timeout);
+        strcat(recvBuf, " ");
+        strcat(recvBuf, maxHops);
         messageL = strlen(recvBuf);
         message = malloc(messageL * sizeof (char) + 1); 
         strcpy(message, recvBuf);
@@ -633,6 +785,7 @@ void *Ping(void *pingArgs) {
     float *avgRTT = args->resAvgRTT;
     char *address = args->address;
     char *numPing = args->numPing;
+    char *timeout = args->timeout;
     
     /*Build file name*/
     sprintf(word, "%d", pthread_self());
@@ -643,6 +796,8 @@ void *Ping(void *pingArgs) {
     /*Build Ping arguments*/
     strcpy(word, "-c ");
     strcat(word, numPing);
+    strcat(word, " -W ");
+    strcat(word, timeout);
     strcat(word, " ");
     cmdArgs = malloc(strlen(word)*sizeof(char) + 1);
     strcpy(cmdArgs, word);
@@ -664,6 +819,10 @@ void *Ping(void *pingArgs) {
         exit(-1);
     }
     while (fgets(line, 4*CHARBUFFER, filePing) != NULL) {
+    }
+    if(strstr(line, "rtt min/avg/max/mdev") == NULL) {
+        printf("%s failed\n", command);
+        exit(-1);
     }
     *avgRTT = atof(&line[AvgRTTOffset]);
    
@@ -689,11 +848,17 @@ void *Traceroute(void *traceArgs) {
     char *cmdArgs = NULL;
     char *command = NULL;    
     char word[CHARBUFFER] = {'8'};
-    char line[4*CHARBUFFER] = {'8'};
+    char line[8*CHARBUFFER] = {'8'};
+    char *check1 = NULL; 
+    char *check2 = NULL;
+    char *ptr = NULL;
+    int i = 0;
     
     TRACEARGS_T args = (TRACEARGS_T)traceArgs;
     int *hops = args->resHops;
     char *address = args->address;
+    char *maxHops = args->hops;
+    char *timeout = args->timeout;
     
     /*Build file name*/
     sprintf(word, "%d", pthread_self());
@@ -701,16 +866,18 @@ void *Traceroute(void *traceArgs) {
     file = malloc(strlen(word)*sizeof(char) + 1);
     strcpy(file, word);
     
-    /*Build Trace arguments
-    strcpy(word, );
-    strcat(word, );
+    /*Build Trace arguments*/
+    strcpy(word, "-m ");
+    strcat(word, maxHops);
+    /*strcat(word, " -w ");
+    strcat(word, timeout);*/
     strcat(word, " ");
     cmdArgs = malloc(strlen(word)*sizeof(char) + 1);
-    strcpy(cmdArgs, word);*/
+    strcpy(cmdArgs, word);
     
-    command = malloc((strlen("traceroute ")+/*strlen(cmdArgs)+*/strlen(address)+strlen(" >| ")+strlen(file))*sizeof(char) + 1);
+    command = malloc((strlen("traceroute ")+strlen(cmdArgs)+strlen(address)+strlen(" >| ")+strlen(file))*sizeof(char) + 1);
     strcpy(command, "traceroute ");
-    /*strcat(command, cmdArgs);*/
+    strcat(command, cmdArgs);
     strcat(command, address);
     strcat(command, " >| ");
     strcat(command, file);
@@ -722,10 +889,22 @@ void *Traceroute(void *traceArgs) {
         printf("Error opening %s\n", file);
         exit(-1);
     }
-    while (fgets(line, 4*CHARBUFFER, fileTrace) != NULL) {
+    fgets(line, 8*CHARBUFFER, fileTrace);
+    check1 = strchr(line, '(');
+    check2 = strchr(line, ')');
+    i = 0;
+    for (ptr = check1; ptr <= check2; ptr++) {
+        word[i] = *ptr;
+        i++;
+    }
+    word[i] = '\0';
+    while (fgets(line, 8*CHARBUFFER, fileTrace) != NULL) {
+    }
+    if(strstr(line, word) == NULL) {
+        printf("%s failed\n", command);
+        exit(-1);
     }
     *hops = atoi(line);
-    
     fclose (fileTrace);
     if (remove(file) != 0) {
         printf("%s not deleted\n", file);
@@ -787,6 +966,7 @@ int BestHops(int *index, int relaySize, int serverHops, int relayHops[]) {
 
 /*Download file and count download time*/
 void *DownloadFile(void *downArgs) {
+    FILE *fileCheck = NULL;
     char *fileName = NULL;
     char *cmdArgs = NULL;
     char *command = NULL;
@@ -796,6 +976,7 @@ void *DownloadFile(void *downArgs) {
     
     DOWNARGS_T args = (DOWNARGS_T)downArgs;
     char *url = args->url;
+    char *timeout = args->timeout;
     float *downTime = args->downTime;
     
     strcpy(line, (strrchr(url, '/') + 1));
@@ -805,7 +986,9 @@ void *DownloadFile(void *downArgs) {
     printf("FileName=%s\n", fileName);
 #endif
     /*Build wget arguments*/
-    strcpy(line, "-q -O ");
+    strcpy(line, "-q -T ");
+    strcat(line, timeout);
+    strcat(line, " -O ");
     strcat(line, fileName);
     strcat(line, " ");
     cmdArgs = malloc(strlen(line)*sizeof(char) + 1);
@@ -821,6 +1004,12 @@ void *DownloadFile(void *downArgs) {
     system(command);
     end = clock();
     *downTime = (float)(end - begin)/CLOCKS_PER_SEC;
+    if (fileCheck = fopen(fileName, "r")) {
+        fclose(fileCheck);
+    } else {
+        printf("File does not exist, %s failed\n", command);
+        exit(-1);
+    }
     
     /*Free*/
     free(fileName); fileName = NULL;
@@ -851,6 +1040,7 @@ void *DownloadRelay(void *downRArgs) {
     char *relayIP = args->relayIP;
     char *relayPort = args->relayPort;
     char *url = args->url;
+    char *timeout = args->timeout;
     float *downTime = args->downTime;
 
     strcpy(buf, (strrchr(url, '/') + 1));
@@ -862,6 +1052,8 @@ void *DownloadRelay(void *downRArgs) {
     
     strcpy(buf, "d ");
     strcat(buf, url);
+    strcat(buf, " ");
+    strcat(buf, timeout);
     messageL = strlen(buf);
     message = malloc(messageL * sizeof (char) + 1);
     strcpy(message, buf);

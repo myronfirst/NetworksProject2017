@@ -1,2 +1,2 @@
-google 3 latency
+google 6 hops
 https://www.google.com/images/branding/googlelogo/1x/googlelogo_white_background_color_272x92dp.png
