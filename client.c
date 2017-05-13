@@ -7,86 +7,80 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+#include<fcntl.h>
+#include "ThreadStructs.h"
 
-#define DEBUG 1
-#define CHARBUFFER 64
-#define SERVERLINES 3
-#define RELAYLINES 2
-#define ARGSLEN 32
-#define AVGRTTOFFSET 30
+#define DEBUG 0
+#define CHARBUFFER 32
+#define FILEBUFFER 1024
 
-/*Thread struct arguments*/
-struct receiveArgs {
-        int sock;
-        float *relayServerAvgRTT;
-        int *relayServerHops;
-    };
-typedef struct receiveArgs RECEIVEARGS_S;
-typedef struct receiveArgs* RECEIVEARGS_T;
-
-struct pingArgs {
-    float *resAvgRTT;
-    char *address;
-    char *numPing;
-};
-typedef struct pingArgs PINGARGS_S;
-typedef struct pingArgs* PINGARGS_T;
-
-struct traceArgs {
-    int *resHops;
-    char *address;
-};
-typedef struct traceArgs TRACEARGS_S;
-typedef struct traceArgs* TRACEARGS_T;
-
-void ReadServers(char* sourceFile, char *serverDomain[], char *serverAlias[]);
-void ReadRelays(char *sourceFile, char *relayAlias[], char *relayIP[], char *relayPort[]);
+/*Reads end_servers.txt and returns user selected endServerDomain*/
+char *ReadServers(char* sourceFile, char *userAlias);
+/*Reads relay_nodes.txt and returns number of relay_nodes*/
+int ReadRelays(char *sourceFile, char ***relayAlias, char ***relayIP, char ***relayPort);
+/*Messages relay to Ping end_Server and created thread to wait for results*/
+void *CommunicateRelay(void *comArgs);
+/*Ping server specified in pingArgs*/
 void *Ping(void *pingArgs);
+/*Traceroute server specified in traceArgs*/
 void *Traceroute(void *traceArgs);
-void MessageRelays(char *endServerDomain, char *relayAlias[], char *relayIP[], char *relayPort[], char numPing[], float relayAvgRTT[], int relayHops[]);
-void *ReceiveRelay(void *recArgs);
-int BestAvgRTT(int *index, float serverAvgRTT, float relayAvgRTT[]);
-int BestHops(int *index, int serverHops, int relayHops[]);
-/*void FreeWorld();*/
+/*Determine best relayIndex via AvgRTT (-1 if direct route to endServer is better), return 1 if there is tie*/
+int BestAvgRTT(int *index, int relaySize, float serverAvgRTT, float relayAvgRTT[]);
+/*Determine best relayIndex via Hops (-1 if direct route to endServer is better), return 1 if there is tie*/
+int BestHops(int *index, int relaySize, int serverHops, int relayHops[]);
+/*Download file and count download time*/
+void *DownloadFile(void *downArgs);
+/*Download file from relay and count download time*/
+void *DownloadRelay(void *downRArgs);
 
 int main(int argc, char* argv[]) {
-    int i = 0;
-    int j = 0;
-    char *serverDomain[SERVERLINES] = {NULL};
-    char *serverAlias[SERVERLINES] = {NULL};
-    char *relayAlias[RELAYLINES] = {NULL};
-    char *relayIP[RELAYLINES] = {NULL};
-    char *relayPort[RELAYLINES] = {NULL};    
-    char alias[ARGSLEN] = {'8'};
-    char numPingBuf[ARGSLEN] = {'8'};
-    char crit[ARGSLEN] = {'8'}; 
-    char *numPing = NULL;
+    pthread_t *comTid = NULL;
+    pthread_t *relayPingTid = NULL;
+    pthread_t *relayTraceTid = NULL;
+    pthread_t *endPingTid = NULL;
+    pthread_t *endTraceTid = NULL;
+    pthread_t *downTid = NULL;
+    pthread_mutex_t lock;
+    COMMUNICATIONARGS_T comArgs = NULL;
+    PINGARGS_T endPingArgs = NULL;
+    TRACEARGS_T endTraceArgs = NULL;
+    PINGARGS_T relayPingArgs = NULL;
+    TRACEARGS_T relayTraceArgs = NULL;
+    DOWNARGS_T downArgs = NULL;
+    int err = -1;
     
-    int endServerIndex = -1;
+    char *userAlias = NULL;
+    char *numPing = NULL;
+    char *criterion = NULL;
     char *endServerAlias = NULL;
     char *endServerDomain = NULL;
+    char **relayAlias = NULL;
+    char **relayIP = NULL;
+    char **relayPort = NULL;
+    int relaySize = 0;    
+    
+    float *transferAvgRTT = NULL;
+    int *transferHops = NULL;
+    float *relayAvgRTT = NULL;
+    int *relayHops = NULL;
     float endServerAvgRTT = 0.0f;
     int endServerHops = 0;
-    
-    float relayAvgRTT[RELAYLINES] = {0.0f};
-    int relayHops[RELAYLINES] = {0};
-    float transferAvgRTT[RELAYLINES] = {0.0f};
-    int transferHops[RELAYLINES] = {0};
     
     int downloadIndex = -1;
     int avgRTTIndex = -1;
     int hopsIndex = -1;
     int tieAvgRTT = 0;
     int tieHops = 0;
+    time_t t;
     
-    char downloadFile[3*CHARBUFFER] = {'8'};
+    char *downloadURL = NULL;
+    float downTime = 0.0f;
     
-    pthread_t pingTid[RELAYLINES];
-    pthread_t traceTid[RELAYLINES];
-    pthread_mutex_t lock;
-    int err;
-    PINGARGS_T pingArgs = NULL;
-    TRACEARGS_T traceArgs = NULL;
+    char word[CHARBUFFER] = {'8'};
+    char line[4*CHARBUFFER] = {'8'};
+    char url[5*CHARBUFFER]  = {'8'};
+    int i = 0; int j = 0;
     
     /*Check arguments*/
     if (argc < 2) {
@@ -94,196 +88,311 @@ int main(int argc, char* argv[]) {
         exit(-1);
     }
     
-    
-    ReadServers(argv[1], serverDomain, serverAlias);
-#if DEBUG
-    puts("End Servers");
-    for(i=0; i < SERVERLINES; i++) {
-        printf("%s L=%d, %s L=%d\n", serverDomain[i], strlen(serverDomain[i]), serverAlias[i], strlen(serverAlias[i]));
-        for(j = 0; j < strlen(serverDomain[i]); j++) {
-            printf("serverDomain[%d][%d]=%c\n", i, j, serverDomain[i][j]);
-        }
-        for(j = 0; j < strlen(serverAlias[i]); j++) {
-            printf("serverAlias[%d][%d]=%c\n", i, j, serverAlias[i][j]);
-        }
+    /*Take user input*/
+    printf("Give input: SERVERALIAS NUMPING CRITERION\n");
+    if (fgets(line, 4*CHARBUFFER, stdin) == NULL) {
+        printf("Wrong input format\n");
+        exit(-1);
     }
+    strcpy(word, strtok(line, " \r\n"));
+    userAlias = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(userAlias, word);
+    strcpy(word, strtok(NULL, " \r\n"));
+    numPing = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(numPing, word);
+    strcpy(word, strtok(NULL, " \r\n"));
+    criterion = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(criterion, word);
+#if DEBUG
+    printf("%s, %s, %s\n", userAlias, numPing, criterion);
+#endif
+    /*Save end_Server Domain and Alias*/
+    endServerDomain = ReadServers(argv[1], userAlias);
+    endServerAlias = userAlias;
+#if DEBUG    
+    printf("endServerAlias=%s\n", endServerAlias);
+    printf("endServerDomain=%s\n", endServerDomain);
 #endif
     
-    
-    ReadRelays(argv[2], relayAlias, relayIP, relayPort);
+    /*Save relay_Servers Alias, IP, Port*/
+    relaySize = ReadRelays(argv[2], &relayAlias, &relayIP, &relayPort);
 #if DEBUG
+    printf("RelaySize=%d\n", relaySize);
+
     puts("Relay Nodes");
-    for(i=0; i < RELAYLINES; i++) {
+    for(i=0; i < relaySize; i++) {
         printf("%s L=%d, %s L=%d, %s L=%d\n", relayAlias[i], strlen(relayAlias[i]), relayIP[i], strlen(relayIP[i]), relayPort[i], strlen(relayPort[i]));
     }
 #endif
     
-    /*Ask user input*/
-    printf("Give input: SERVERALIAS NUMPING CRITERION\n");
-    scanf(" %s %s %s", alias, numPingBuf, crit);
-    numPing = malloc(strlen(numPingBuf)*sizeof(char) + 1);
-    strcpy(numPing, numPingBuf);
-#if DEBUG
-    printf("%s, %s, %s\n", alias, numPing, crit);
+    /*Initialize thread lock*/
+    if (pthread_mutex_init(&lock, NULL) != 0) {
+        printf("mutex init failed\n");
+        exit(-1);
+    }
+    /*Assign each receiveThread to a socket*/
+    transferAvgRTT = malloc(relaySize*sizeof(float));
+    transferHops = malloc(relaySize*sizeof(int));
+    comArgs = malloc(relaySize*sizeof(COMMUNICATIONARGS_S));
+    comTid = malloc(relaySize*sizeof(pthread_t));
+    for (i = 0; i < relaySize; i++) {        
+        comArgs[i].endServerDomain = endServerDomain;
+        comArgs[i].numPing = numPing;
+        comArgs[i].relayIP = relayIP[i];
+        comArgs[i].relayPort = relayPort[i];
+        comArgs[i].relayServerAvgRTT = &(transferAvgRTT[i]);
+        comArgs[i].relayServerHops = &(transferHops[i]);
+        err = pthread_create(&(comTid[i]), NULL, &CommunicateRelay, &(comArgs[i]));
+        if (err != 0) {
+            printf("Communicate Relay can't create thread :[%s]\n", strerror(err));
+            exit(-1);
+        }
+        /*pthread_join(comTid[i], NULL);*/
+    }    
+#if (DEBUG>1)
+    for(i=0; i < relaySize; i++) {
+        printf("&(comTid[%d])=%d\n", i, &(recTid[%i]));
+        printf("&(relayPingTid[%d])=%d\n", i, &(relayPingTid[%i]));
+        printf("&(relayTraceTid[%d])=%d\n", i, &(relayTraceTid[%i]));
+    }
+    printf("endPingTid=%d\n", i, endPingTid);
+    printf("endTraceTid=%d\n", i, endTraceTid);
+    for (i = 0; i < relaySize; i++) {
+        printf("transferAvgRTT[%d]= %f, transferAvgHops[%d]=%d\n", i, transferAvgRTT[i], i, transferHops[i]);
+    }
 #endif
     
-    /*Search Domain*/ /*Do Binary*/
-    i = 0;
-    endServerIndex = -1;
-    while((i < SERVERLINES) && (endServerIndex == -1)) {
-        if (strcmp(serverAlias[i], alias) == 0) {
-            endServerIndex = i;
-        }
-        i++;
-    }
-    if (endServerIndex == -1) {
-        printf("Server not in file. Exiting\n");
-        exit(-1);
-    }
-    endServerAlias = serverAlias[endServerIndex];
-    endServerDomain = serverDomain[endServerIndex];
-#if DEBUG
-    printf("endServerAlias= %s\n", endServerAlias);
-    printf("endServerDomain= %s\n", endServerDomain);
-#endif
-    /*ping-trace end server*/
-    if (pthread_mutex_init(&lock, NULL) != 0) {
-        printf("ping-trace endServer: mutex init failed\n");
-        exit(-1);
-    }
-    pingArgs = malloc(sizeof(PINGARGS_S));
-    pingArgs->resAvgRTT = &endServerAvgRTT;
-    pingArgs->address = endServerDomain;
-    pingArgs->numPing = numPing;
-    /*start endServer ping thread*/
-    err = pthread_create(&(pingTid[0]), NULL, &Ping, pingArgs);
+    /*endServer ping thread*/
+    endServerAvgRTT = -1;
+    endPingArgs = malloc(sizeof(PINGARGS_S));
+    endPingArgs->resAvgRTT = &endServerAvgRTT;
+    endPingArgs->address = endServerDomain;
+    endPingArgs->numPing = numPing;
+    endPingTid = malloc(sizeof(pthread_t));
+    err = pthread_create(endPingTid, NULL, &Ping, endPingArgs);
     if (err != 0) {
         printf("ping endServer: can't create thread :[%s]\n", strerror(err));
         exit(-1);
     }
-
-    traceArgs = malloc(sizeof(TRACEARGS_S));
-    traceArgs->resHops = &endServerHops;
-    traceArgs->address = endServerDomain;
-    /*start endServer trace thread*/
-    err = pthread_create(&(traceTid[0]), NULL, &Traceroute, traceArgs);
+    /*pthread_join(*endPingTid, NULL);*/
+    
+    /*endServer trace thread*/
+    endServerHops = -1;
+    endTraceArgs = malloc(sizeof(TRACEARGS_S));
+    endTraceArgs->resHops = &endServerHops;
+    endTraceArgs->address = endServerDomain;
+    endTraceTid = malloc(sizeof(pthread_t));
+    err = pthread_create(endTraceTid, NULL, &Traceroute, endTraceArgs);
     if (err != 0) {
-        printf("trace endServer:can't create thread :[%s]\n", strerror(err));
+        printf("trace endServer: can't create thread :[%s]\n", strerror(err));
         exit(-1);
     }
-    pthread_join(pingTid[0], NULL);
-    pthread_join(traceTid[0], NULL);
-    pthread_mutex_destroy(&lock); //Destroy --> Free the lock after serving its purpose
-    
-#if DEBUG
-    printf("endServerAvgRTT=%f, endServerHops=%d\n", endServerAvgRTT, endServerHops);
+    /*pthread_join(*endTraceTid, NULL);*/
+#if (DEBUG>1)
+    for (i = 0; i < relaySize; i++) {
+        printf("transferAvgRTT[%d]= %f, transferAvgHops[%d]=%d\n", i, transferAvgRTT[i], i, transferHops[i]);
+    }
+    printf("endServerAvgRTT=%f\n", endServerAvgRTT);
+    printf("endServerHops=%d\n", endServerHops);
 #endif
-    /*Tell relays to ping-trace and send results*/
-    MessageRelays(endServerDomain, relayAlias, relayIP, relayPort, numPing, transferAvgRTT, transferHops);
-    /*Threads should have finished filling relayAvgRTT[] and relayHops[]*/
-    for (i = 0; i < RELAYLINES; i++) {
-        printf("relay-->end_server: transferAvgRTT[%d]=%f, transferHops[%d]=%d\n", i, transferAvgRTT[i], i, transferHops[i]);
-    }
     
-    /*ping-trace relay_servers*/
-    if (pthread_mutex_init(&lock, NULL) != 0) {
-        printf("ping-trace relayServers: mutex init failed\n");
-        exit(-1);
-    }
-    for (i = 0; i < RELAYLINES; i++) {
-        pingArgs = malloc(sizeof (PINGARGS_S));
-        pingArgs->resAvgRTT = &relayAvgRTT[i];
-        pingArgs->address = relayIP[i];
-        pingArgs->numPing = numPing;
-        /*start relayServer ping thread*/
-        err = pthread_create(&(pingTid[i]), NULL, &Ping, pingArgs);
+    relayAvgRTT = malloc(relaySize*sizeof(float));
+    relayHops = malloc(relaySize*sizeof(int));
+    relayPingArgs = malloc(relaySize*sizeof(PINGARGS_S));
+    relayTraceArgs = malloc(relaySize*sizeof(TRACEARGS_S));
+    relayPingTid = malloc(relaySize*sizeof(pthread_t));
+    relayTraceTid = malloc(relaySize*sizeof(pthread_t));
+    for (i = 0; i < relaySize; i++) {
+#if DEBUG
+        printf("RelayIP[%d]=%s\n", i, relayIP[i]);
+#endif
+        /*relayServer ping thread*/
+        relayPingArgs[i].numPing = numPing;
+        relayPingArgs[i].address = relayIP[i];
+        relayPingArgs[i].resAvgRTT = &(relayAvgRTT[i]);
+        err = pthread_create(&(relayPingTid[i]), NULL, &Ping, &(relayPingArgs[i]));
         if (err != 0) {
             printf("ping relayServer: can't create thread :[%s]\n", strerror(err));
             exit(-1);
         }
-        pthread_join(pingTid[i], NULL); /*debug*/
-        traceArgs = malloc(sizeof (TRACEARGS_S));
-        traceArgs->resHops = &relayHops[i];
-        traceArgs->address = relayIP[i];
-        /*start endServer trace thread*/
-        err = pthread_create(&(traceTid[i]), NULL, &Traceroute, traceArgs);
+        /*pthread_join(relayPingTid[i], NULL);*/
+        
+        /*relayServer trace thread*/
+        relayTraceArgs[i].address = relayIP[i];
+        relayTraceArgs[i].resHops = &(relayHops[i]);        
+        err = pthread_create(&(relayTraceTid[i]), NULL, &Traceroute, &(relayTraceArgs[i]));
         if (err != 0) {
-            printf("trace endServer:can't create thread :[%s]\n", strerror(err));
+            printf("trace endServer: can't create thread :[%s]\n", strerror(err));
             exit(-1);
         }
-        pthread_join(traceTid[i], NULL); /*debug*/
-        printf("client-->relay: relayAvgRTT[%d]=%f, relayHops[%d]=%d\n", i, relayAvgRTT[i], i, relayHops[i]);
+        /*pthread_join(relayTraceTid[i], NULL);*/
     }
-    for (i = 0; i < RELAYLINES; i++) {
-        pthread_join(pingTid[i], NULL);
-        pthread_join(traceTid[i], NULL);
+    
+    /*Wait for threads to finish*/
+    printf("Gathering statistical information...\n");
+    for (i = 0; i < relaySize; i++) {
+        pthread_join(comTid[i], NULL);
+    }
+    pthread_join(*endPingTid, NULL);
+    pthread_join(*endTraceTid, NULL);
+    for (i = 0; i < relaySize; i++) {
+        pthread_join(relayPingTid[i], NULL);
+        pthread_join(relayTraceTid[i], NULL);
     }
     pthread_mutex_destroy(&lock);
-    
+#if DEBUG
+    for (i = 0; i < relaySize; i++) {
+        printf("transferAvgRTT[%d]= %f, transferAvgHops[%d]=%d\n", i, transferAvgRTT[i], i, transferHops[i]);
+    }
+    printf("endServerAvgRTT=%f\n", endServerAvgRTT);
+    printf("endServerHops=%d\n", endServerHops);
+    for (i = 0; i < relaySize; i++) {
+        printf("relayAvgRTT[%d]= %f, relayAvgHops[%d]=%d\n", i, relayAvgRTT[i], i, relayHops[i]);
+    }
+#endif
     /*Sum*/
-    for (i=0; i < RELAYLINES; i++) {
+    for (i=0; i < relaySize; i++) {
         relayAvgRTT[i] += transferAvgRTT[i];
         relayHops[i] += transferHops[i];
-        printf("SUM: relayAvgRTT[%d]=%f, relayHops[%d]=%d\n", i, relayAvgRTT[i], i, relayHops[i]);
     }
+#if DEBUG
+    printf("SUM\n");
+    for (i=0; i < relaySize; i++) {
+        printf("relayAvgRTT[%d]=%f, relayHops[%d]=%d\n", i, relayAvgRTT[i], i, relayHops[i]);
+    }
+#endif
     
     /*Select relay index*/
-    tieAvgRTT = BestAvgRTT(&avgRTTIndex, endServerAvgRTT, relayAvgRTT);
+    tieAvgRTT = BestAvgRTT(&avgRTTIndex, relaySize, endServerAvgRTT, relayAvgRTT);
+#if DEBUG
     printf("avgRTTIndex= %d, tieAvgRTT=%d\n", avgRTTIndex, tieAvgRTT);
-    tieHops = BestHops(&hopsIndex, endServerHops, relayHops);
+#endif
+    tieHops = BestHops(&hopsIndex, relaySize, endServerHops, relayHops);
+#if DEBUG
     printf("hopsIndex= %d, tieHops=%d\n", hopsIndex, tieHops);
+#endif
     
-    if ((strcmp(crit, "latency")==0) && (tieAvgRTT==0)) {
-        puts("selecting avgRTTIndex");
+    /*Select downloadIndex via user choice*/
+    if ((strcmp(criterion, "latency") == 0) && (tieAvgRTT == 0)) {
+        if (tieHops == 1) printf("TIE on HOPS CRITERION");
+        printf("Selecting best route via LATENCY\n");
         downloadIndex = avgRTTIndex;
-    }else if ((strcmp(crit, "hops")==0) && (tieHops==0)){
-        puts("selecting HopsIndex");
+    } else if ((strcmp(criterion, "hops") == 0) && (tieHops == 0)) {
+        if (tieAvgRTT == 1) printf("TIE on LATENCY CRITERION");
+        printf("Selecting best route via HOPS\n");
         downloadIndex = hopsIndex;
-    }else {
-        puts("selecting RandomIndex (avgRTT)");
-        downloadIndex = avgRTTIndex; /*Random*/
+    } else {
+        printf("TIE on BOTH CRITERIA");
+        printf("Selecting best route via RANDOM CRITERION\n");
+        srand((unsigned) time(&t));
+        if ((rand() % 2) == 0) {
+            downloadIndex = avgRTTIndex;
+            printf("Selecting best route via LATENCY\n");
+        } else {
+            downloadIndex = hopsIndex;
+            printf("Selecting best route via HOPS\n");
+        }
     }
+    downloadIndex = -1; /*DEBUG*/
+#if DEBUG
     printf("downloadIndex=%d\n", downloadIndex);
-    if (downloadIndex = -1) {
-        printf("Direct download from end_server=%s\n", endServerAlias);
-    }else {
-        printf("Download via relay_node=%s, from end_server=%s\n", relayAlias[downloadIndex], endServerAlias);
-    }
+#endif
     /*download file*/
-    printf("Input file to download:\n");
-    scanf(" %s", downloadFile);
-    strcpy(downloadFile, strtok(downloadFile, "\r\n"));
-    if (strstr(downloadFile, endServerAlias)==NULL) {
-        printf("File does not match server. Exiting\n");
+    printf("Input file URL to download:\n");
+    if (fgets(url, 5*CHARBUFFER, stdin) == NULL) {
+        printf("Wrong input format\n");
         exit(-1);
     }
-    printf("downloadFile= %s\n", downloadFile);
-    
-    
-    
-    /*Free stuff*/
-    for (i=0; i < SERVERLINES; i++) {
-        free(serverDomain[i]); serverDomain[i]= NULL;
-        free(serverAlias[i]); serverAlias[i] = NULL;
+    strtok(url, " \r\n");
+    downloadURL = malloc(strlen(url)*sizeof(char) + 1);
+    strcpy(downloadURL, url);
+    if (strstr(downloadURL, endServerAlias)==NULL) {
+        printf("File URL not match endServer URL. Exiting\n");
+        exit(-1);
     }
-    for (i=0; i < RELAYLINES; i++) {
-        free(relayAlias[i]); relayAlias[i]= NULL;
-        free(relayIP[i]); relayIP[i]= NULL;
-        free(relayPort[i]); relayPort[i]= NULL;
+#if DEBUG
+    printf("downloadURL= %s\n", downloadURL);
+#endif
+    if (downloadIndex == -1) {
+        printf("Direct download from end_server=%s\n", endServerAlias);
+        downArgs = malloc(sizeof (DOWNARGS_S));
+        downArgs->relayIP = NULL;
+        downArgs->relayPort = NULL;
+        downArgs->url = downloadURL;
+        downArgs->downTime = &downTime;
+        downTid = malloc(sizeof (pthread_t));
+        err = pthread_create(downTid, NULL, &DownloadFile, downArgs);
+        if (err != 0) {
+            printf("Download File: can't create thread :[%s]\n", strerror(err));
+            exit(-1);
+        }
+        printf("Waiting for file Download\n");
+        pthread_join(*downTid, NULL);
+        printf("Download Time: %f seconds\n", downTime);
+    }else {
+        printf("Download via relay_node=%s, from end_server=%s\n", relayAlias[downloadIndex], endServerAlias);
+        downArgs = malloc(sizeof (DOWNARGS_S));
+        downArgs->relayIP = relayIP[downloadIndex];
+        downArgs->relayPort = relayPort[downloadIndex];
+        downArgs->url = downloadURL;
+        downArgs->downTime = &downTime;
+        downTid = malloc(sizeof (pthread_t));
+        err = pthread_create(downTid, NULL, &DownloadRelay, downArgs);
+        if (err != 0) {
+            printf("Download File From Relay: can't create thread :[%s]\n", strerror(err));
+            exit(-1);
+        }
+        printf("Waiting for file Download\n");
+        pthread_join(*downTid, NULL);
+        printf("Download Time: %f seconds\n", downTime);
     }
-    free(numPing);
-    free (pingArgs);
-    free (traceArgs);
-    /*FreeWorld();*/
+    
+    /*Free*/
+    free(userAlias); userAlias = NULL;
+    free(numPing); numPing = NULL;
+    free(criterion); criterion = NULL;
+    free(endServerDomain); endServerDomain = NULL;
+    free(endServerAlias); endServerAlias = NULL;
+    for (i = 0; i < relaySize; i++) {
+        free(relayAlias[i]); relayAlias[i] = NULL;
+        free(relayIP[i]); relayIP[i] = NULL;
+        free(relayPort[i]); relayPort[i] = NULL;
+    }
+    free(relayAlias);relayAlias = NULL; 
+    free(relayIP); relayIP = NULL;
+    free(relayPort); relayPort = NULL;
+    free(comTid); comTid = NULL;
+    free(relayPingTid); relayPingTid = NULL;
+    free(relayTraceTid); relayTraceTid = NULL;
+    free(endPingTid); endPingTid = NULL;
+    free(endTraceTid); endTraceTid = NULL;
+    free(downTid); downTid = NULL;
+    free(comArgs); comArgs = NULL;
+    free(relayPingArgs); relayPingArgs = NULL;
+    free(relayTraceArgs); relayTraceArgs = NULL;
+    free(endPingArgs); endPingArgs = NULL;
+    free(endTraceArgs); endTraceArgs = NULL;
+    free(transferAvgRTT); transferAvgRTT = NULL;
+    free(transferHops); transferHops = NULL;
+    free(relayAvgRTT); relayAvgRTT = NULL;
+    free(relayHops); relayHops = NULL;
+    free(downArgs); downArgs = NULL;
+    
     /*system("PAUSE");*/
     return 0;
 }
 
-void ReadServers(char* sourceFile, char *serverDomain[], char *serverAlias[]) {
-    char line[CHARBUFFER] = {'8'};
-    char word[CHARBUFFER] = {'8'};
-    int i =0;
+/*Reads end_servers.txt and returns user selected end_server*/
+char *ReadServers(char* sourceFile, char *userAlias) {
     FILE *fileServers = NULL;
+    char *endServerDomain = NULL;
+    int endServerIndex = -1;
+    int serverSize = 0;
+    char **serverDomain = NULL;
+    char **serverAlias = NULL;
+    char line[4*CHARBUFFER] = {'8'};
+    char word[CHARBUFFER] = {'8'};
+    int i = 0; int j = 0;
     
     /*Open end_servers.txt*/
     fileServers = fopen(sourceFile, "r");
@@ -292,8 +401,22 @@ void ReadServers(char* sourceFile, char *serverDomain[], char *serverAlias[]) {
         exit(-1);
     }
     
+    /*Count serverSize*/
+    serverSize = 0;
     i = 0;
-    while (fgets(line, CHARBUFFER, fileServers) != NULL) {
+    while (fgets(line, 4*CHARBUFFER, fileServers) != NULL) {
+        serverSize++;
+    }
+    rewind(fileServers);
+#if DEBUG
+    printf("serverSize=%d\n", serverSize);
+#endif
+    
+    /*Create server Arrays*/
+    serverDomain = malloc(serverSize*sizeof(char*));
+    serverAlias = malloc(serverSize*sizeof(char*));
+    i = 0;
+    while (fgets(line, 4*CHARBUFFER, fileServers) != NULL) {
         /*store Domain*/
         strcpy(word, strtok(line, ", \r\n"));
         serverDomain[i] = malloc(strlen(word)*sizeof(char) + 1);
@@ -311,14 +434,55 @@ void ReadServers(char* sourceFile, char *serverDomain[], char *serverAlias[]) {
         i++;
     }
     fclose(fileServers);
-    return;
+    
+    /*Find user selected endServerDomain*/
+    i = 0;
+    endServerIndex = -1;
+    while((i < serverSize) && (endServerIndex == -1)) {
+        if (strcmp(serverAlias[i], userAlias) == 0) {
+            endServerIndex = i;
+        }
+        i++;
+    }
+    if (endServerIndex == -1) {
+        printf("%s does not exist in %s\n", userAlias, sourceFile);
+        exit(-1);
+    }
+    strcpy(word, serverDomain[endServerIndex]);
+    endServerDomain = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(endServerDomain, word);    
+#if (DEBUG>1)
+    puts("End Servers");
+    for(i=0; i < serverSize; i++) {
+        printf("%s L=%d, %s L=%d\n", serverDomain[i], strlen(serverDomain[i]), serverAlias[i], strlen(serverAlias[i]));
+        for(j = 0; j < strlen(serverDomain[i]); j++) {
+            printf("serverDomain[%d][%d]=%c\n", i, j, serverDomain[i][j]);
+        }
+        for(j = 0; j < strlen(serverAlias[i]); j++) {
+            printf("serverAlias[%d][%d]=%c\n", i, j, serverAlias[i][j]);
+        }
+    }
+#endif    
+    /*Free*/
+    for (i=0; i < serverSize; i++) {
+        free(serverDomain[i]); serverDomain[i] = NULL;
+        free(serverAlias[i]); serverAlias[i] = NULL;
+    }
+    free(serverDomain); serverDomain = NULL;
+    free(serverAlias); serverAlias = NULL;
+#if DEBUG
+    puts("ReadServers Returning");
+#endif
+    return endServerDomain;
 }
 
-void ReadRelays(char *sourceFile, char *relayAlias[], char *relayIP[], char *relayPort[]) {
-    char line[CHARBUFFER] = {'8'};
-    char word[CHARBUFFER] = {'8'};
-    int i = 0;
+/*Reads relay_nodes.txt and returns number of relay_nodes*/
+int ReadRelays(char *sourceFile, char ***relayAlias, char ***relayIP, char ***relayPort) {
     FILE *fileRelays = NULL;
+    int relaySize = 0;
+    char word[CHARBUFFER] = {'8'};
+    char line[4*CHARBUFFER] = {'8'};
+    int i = 0;    
     
     /*Open relay_nodes.txt*/
     fileRelays = fopen(sourceFile, "r");
@@ -327,59 +491,163 @@ void ReadRelays(char *sourceFile, char *relayAlias[], char *relayIP[], char *rel
         exit(-1);
     }
     
-    while (fgets(line, CHARBUFFER, fileRelays) != NULL) {
+    /*Count relaySize*/
+    relaySize = 0;
+    i = 0;
+    while (fgets(line, 4*CHARBUFFER, fileRelays) != NULL) {
+        relaySize++;
+    }
+    rewind(fileRelays);
+#if DEBUG
+    printf("relaySize=%d\n", relaySize);
+#endif
+    
+    /*Create relay Arrays*/
+    *relayAlias = malloc(relaySize*sizeof(char*));
+    *relayIP = malloc(relaySize*sizeof(char*));
+    *relayPort = malloc(relaySize*sizeof(char*));    
+    i = 0;    
+    while (fgets(line, 4*CHARBUFFER, fileRelays) != NULL) {
         /*store relayAlias*/
         strcpy(word, strtok(line, ", \r\n"));
-        relayAlias[i] = malloc(strlen(word)*sizeof(char) + 1);
-        strcpy (relayAlias[i], word);
+        (*relayAlias)[i] = malloc(strlen(word)*sizeof(char) + 1);
+        strcpy ((*relayAlias)[i], word);
 #if DEBUG
-        printf("RAlias[%d]=%s\n", i, relayAlias[i]);
+        printf("RAlias[%d]=%s\n", i, (*relayAlias)[i]);
 #endif
         /*store relayIP*/
         strcpy(word, strtok(NULL, ", \r\n"));
-        relayIP[i] = malloc(strlen(word)*sizeof(char) + 1);
-        strcpy (relayIP[i], word);
+        (*relayIP)[i] = malloc(strlen(word)*sizeof(char) + 1);
+        strcpy ((*relayIP)[i], word);
 #if DEBUG
-        printf("RIP[%d]=%s\n", i, relayIP[i]);
+        printf("RIP[%d]=%s\n", i, (*relayIP)[i]);
 #endif
         /*store relayPort*/
         strcpy(word, strtok(NULL, ", \r\n"));
-        relayPort[i] = malloc(strlen(word)*sizeof(char) + 1);
-        strcpy (relayPort[i], word);
+        (*relayPort)[i] = malloc(strlen(word)*sizeof(char) + 1);
+        strcpy ((*relayPort)[i], word);
 #if DEBUG
-        printf("RPort[%d]=%s\n", i, relayPort[i]);
+        printf("RPort[%d]=%s\n", i, (*relayPort)[i]);
 #endif
         i++;
     }
     fclose(fileRelays);
-    return;
+#if DEBUG
+    puts("Returning ReadRelays");
+#endif
+    return relaySize;
 }
 
+/*Messages relay to Ping end_Server and created thread to wait for results*/
+void *CommunicateRelay(void *comArgs) {
+    int sock = -1;
+    char *message = NULL;
+    int messageL = 0;
+    int bytesRec = 0;
+    char recvBuf[FILEBUFFER] = {'8'};
+    struct sockaddr_in ServAddr; /* server address */
+     
+    COMMUNICATIONARGS_T args = (COMMUNICATIONARGS_T)comArgs;
+    char *endServerDomain = args->endServerDomain;
+    char *numPing = args->numPing;
+    char *relayIP = args->relayIP;
+    char *relayPort = args->relayPort;
+    float *relayServerAvgRTT = args->relayServerAvgRTT;
+    int *relayServerHops = args->relayServerHops;
+
+#if DEBUG
+    printf("Args: endServerDomain=%s, numPing=%s, relayIp=%s, relayPort=%s\n", endServerDomain, numPing, relayIP, relayPort);
+#endif        
+        strcpy(recvBuf, "p ");
+        strcat(recvBuf, endServerDomain);
+        strcat(recvBuf, " ");
+        strcat(recvBuf, numPing);
+        messageL = strlen(recvBuf);
+        message = malloc(messageL * sizeof (char) + 1); 
+        strcpy(message, recvBuf);
+#if DEBUG
+        printf("relayIP=%s, relayPort=%u, message=%s, messageLength=%d\n", relayIP, (unsigned short)atoi(relayPort), message, messageL);
+#endif
+        /* Create a reliable, stream socket using TCP */
+        if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+            printf("socket() failed\n");
+            exit(-1);
+        }
+#if DEBUG
+        printf("Sock=%d Created\n", sock);
+#endif
+        /* Construct the server address structure */
+        memset(&ServAddr, 0, sizeof (ServAddr)); /* Zero out structure */
+        ServAddr.sin_family = AF_INET; /* Internet address family */
+        ServAddr.sin_addr.s_addr = inet_addr(relayIP); /* Relay_Server IP address */
+        ServAddr.sin_port = htons((unsigned short)atoi(relayPort)); /* Relay_Server port */
+        /* Establish the connection to the echo server */
+        if (connect(sock, (struct sockaddr *) &ServAddr, sizeof (ServAddr)) < 0) {
+            printf("Sock=%d connect() failed\n", sock);
+            exit(-1);
+        }
+#if DEBUG
+        printf("Sock=%d Connected\n", sock);
+#endif
+        if (send(sock, message, messageL, 0) != messageL) {
+            printf("send() sent a different number of bytes than expected");
+        }
+#if DEBUG
+        printf("Sock=%d Message Sent\n", sock);
+#endif
+    messageL = 0;
+    /* Receive message from client */
+    if ((bytesRec = recv(sock, recvBuf, FILEBUFFER - 1, 0)) < 0) {
+        printf("(socket=%d) recv() failed\n", sock);
+        exit(-1);
+    }
+    messageL += bytesRec;
+    recvBuf[messageL] = '\0'; /* Terminate the string! */
+#if DEBUG
+        printf("Received: %s\n", recvBuf);
+#endif
+    *relayServerAvgRTT = atof(strtok(recvBuf, " \n"));
+    *relayServerHops = atof(strtok(NULL, " \n"));
+    
+#if DEBUG
+    printf("(socket=%d) ReceiveRelay: sock=%d, *relayServerAvgRTT=%f, *relayServerHops=%d\n", sock, sock, *relayServerAvgRTT, *relayServerHops);
+    printf("(socket=%d) Returning\n", sock);
+#endif
+    close (sock);
+    /*Free*/
+    free(message);
+    return NULL;
+}
+
+/*Ping server specified in pingArgs*/
 void *Ping(void *pingArgs) {
-    char *command = NULL;
-    char cmdArgs[ARGSLEN] = {'8'};
-    char file[ARGSLEN] = {'8'};
+    int AvgRTTOffset = 30; /*Constant*/
     FILE *filePing = NULL;
-    int i = 0;
-    char line[CHARBUFFER] = {'8'};
-    char *ptrLine = line;
+    char *file = NULL;
+    char *cmdArgs = NULL;
+    char *command = NULL;    
+    char word[CHARBUFFER] = {'8'};
+    char line[4*CHARBUFFER] = {'8'};
     
     PINGARGS_T args = (PINGARGS_T)pingArgs;
     float *avgRTT = args->resAvgRTT;
     char *address = args->address;
-    char *numPing = args->numPing;    
-    pthread_t tid;
-    char id[ARGSLEN] = {'8'};
-    tid = pthread_self();
-    sprintf(id, "%d", tid);
+    char *numPing = args->numPing;
     
-    strcpy(cmdArgs, "-c ");
-    strcat(cmdArgs, numPing);
-    strcat(cmdArgs, " ");
+    /*Build file name*/
+    sprintf(word, "%d", pthread_self());
+    strcat(word, "-ping_res");
+    file = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(file, word);
     
-    strcpy(file, id);
-    strcat(file, "ping_res");
+    /*Build Ping arguments*/
+    strcpy(word, "-c ");
+    strcat(word, numPing);
+    strcat(word, " ");
+    cmdArgs = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(cmdArgs, word);
     
+    /*Build Ping command*/
     command = malloc((strlen("ping ")+strlen(cmdArgs)+strlen(address)+strlen(" >| ")+strlen(file))*sizeof(char) + 1);
     strcpy(command, "ping ");
     strcat(command, cmdArgs);
@@ -389,46 +657,60 @@ void *Ping(void *pingArgs) {
     printf("%s\n", command);
     system(command);
     
+    /*Extract avgRTT from file*/
     filePing = fopen(file, "r+");
     if (filePing == NULL) {
         printf("Error opening %s\n", file);
         exit(-1);
     }
-    while (fgets(line, CHARBUFFER, filePing) != NULL) {
+    while (fgets(line, 4*CHARBUFFER, filePing) != NULL) {
     }
-    ptrLine = &line[AVGRTTOFFSET];
-    *avgRTT = atof(ptrLine);
-    printf("Ping: %s, returns: %f\n", address, *avgRTT);
-    
+    *avgRTT = atof(&line[AvgRTTOffset]);
+   
+    /*Delete file*/
     fclose (filePing);
     if (remove(file) != 0) {
         printf("%s not deleted\n", file);
     }
+    /*Free*/
+    free(file); file = NULL;
+    free(cmdArgs); cmdArgs = NULL;
     free(command); command = NULL;
+#if DEBUG
+    printf("Ping: %s, returns: %f\n", address, *avgRTT);
+#endif
     return NULL;
 }
 
-void *Traceroute(void *traceArgs) {
-    char *command = NULL;
-    char file[ARGSLEN] = {'8'};
+/*Traceroute server specified in traceArgs*/
+void *Traceroute(void *traceArgs) {    
     FILE *fileTrace = NULL;
-    int i = 0;
+    char *file = NULL;
+    char *cmdArgs = NULL;
+    char *command = NULL;    
+    char word[CHARBUFFER] = {'8'};
     char line[4*CHARBUFFER] = {'8'};
-    char *ptrLine = line;
-    pthread_t tid;
-    char id[ARGSLEN] = {'8'};
-    tid = pthread_self();
-    sprintf(id, "%d", tid);
     
     TRACEARGS_T args = (TRACEARGS_T)traceArgs;
     int *hops = args->resHops;
     char *address = args->address;
     
-    strcpy(file, id);
-    strcat(file, "trace_res");
+    /*Build file name*/
+    sprintf(word, "%d", pthread_self());
+    strcat(word, "-trace_res");
+    file = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(file, word);
     
-    command = malloc((strlen("traceroute ")+strlen(address)+strlen(" >| ")+strlen(file))*sizeof(char) + 1);
+    /*Build Trace arguments
+    strcpy(word, );
+    strcat(word, );
+    strcat(word, " ");
+    cmdArgs = malloc(strlen(word)*sizeof(char) + 1);
+    strcpy(cmdArgs, word);*/
+    
+    command = malloc((strlen("traceroute ")+/*strlen(cmdArgs)+*/strlen(address)+strlen(" >| ")+strlen(file))*sizeof(char) + 1);
     strcpy(command, "traceroute ");
+    /*strcat(command, cmdArgs);*/
     strcat(command, address);
     strcat(command, " >| ");
     strcat(command, file);
@@ -443,148 +725,33 @@ void *Traceroute(void *traceArgs) {
     while (fgets(line, 4*CHARBUFFER, fileTrace) != NULL) {
     }
     *hops = atoi(line);
-    printf("Traceroute: %s, returns: %d\n", address, *hops);
     
     fclose (fileTrace);
     if (remove(file) != 0) {
         printf("%s not deleted\n", file);
     }
+    /*Free*/
+    free(file); file = NULL;
+    free(cmdArgs); cmdArgs = NULL;
     free(command); command = NULL;
+#if DEBUG
+    printf("Traceroute: %s, returns: %d\n", address, *hops);
+#endif
     return NULL;
 }
 
-void MessageRelays(char *endServerDomain, char *relayAlias[], char *relayIP[], char *relayPort[], char numPing[], float relayAvgRTT[], int relayHops[]) {
-    int sock = -1;                        /* Socket descriptor */
-    struct sockaddr_in ServAddr;         /* server address */
-    char *servAlias = NULL;
-    char *servIP = NULL;     
-    unsigned short servPort = 0;         /* server port */
-    char *message = NULL;           /* message to relayServer */
-    int messageL = 0;
-    int bytesRcvd = 0;              /* Bytes read in single recv() */
-    int totalBytesRcvd = 0;
-    char recvBuffer[CHARBUFFER] = {'8'};
-    int i = 0;
-    
-    pthread_t tid[RELAYLINES];
-    pthread_mutex_t lock;
-    int err;
-    RECEIVEARGS_T recArgs = NULL;
-    
-    if (pthread_mutex_init(&lock, NULL) != 0) {
-        printf("mutex init failed\n");
-        exit(-1);
-    }
-
-    for (i = 0; i < RELAYLINES; i++) {
-        printf("Args: relayAlias=%s, relayIp=%s, relayPort=%s\n", relayAlias[i], relayIP[i], relayPort[i]);
-        servAlias = relayAlias[i];
-        servIP = relayIP[i];
-        servPort = atoi(relayPort[i]);
-        message = malloc(strlen("p www.CamenosScientofilos.com 6666") * sizeof (char) + 1);
-        strcpy(message, "p ");
-        strcat(message, endServerDomain);
-        strcat(message, " ");
-        strcat(message, numPing);
-        messageL = strlen(message);
-        printf("servIP=%s, servPort=%u, message=%s, messageLength=%d\n", servIP, servPort, message, messageL);
-        /* Create a reliable, stream socket using TCP */
-        if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
-            printf("socket() failed\n");
-            exit(-1);
-        }
-        printf("Sock=%d Created\n", sock);
-        /* Construct the server address structure */
-        memset(&ServAddr, 0, sizeof (ServAddr)); /* Zero out structure */
-        ServAddr.sin_family = AF_INET; /* Internet address family */
-        ServAddr.sin_addr.s_addr = inet_addr(servIP); /* Server IP address */
-        ServAddr.sin_port = htons(servPort); /* Server port */
-        /* Establish the connection to the echo server */
-        if (connect(sock, (struct sockaddr *) &ServAddr, sizeof (ServAddr)) < 0) {
-            printf("Sock=%d connect() failed\n", sock);
-            exit(-1);
-        }
-        printf("Sock=%d Connected\n", sock);
-
-        if (send(sock, message, messageL, 0) != messageL) {
-            printf("send() sent a different number of bytes than expected");
-        }
-        printf("Sock=%d Message Sent\n", sock);
-
-        /*threads awating response from relays*/
-        /*init thread argument struct*/
-        recArgs = malloc(sizeof(RECEIVEARGS_S));
-        recArgs->sock = sock;
-        recArgs->relayServerAvgRTT = &relayAvgRTT[i];
-        recArgs->relayServerHops = &relayHops[i];
-#if DEBUG
-        printf("recArgs struct before thread:\n sock=%d, *relayServerAvgRTT=%f, *relayServerHops=%d\n", recArgs->sock, *(recArgs->relayServerAvgRTT), *(recArgs->relayServerHops));
-#endif
-        // pthread_create(&Thread_var, NULL, &Thread_function, &Thread_args);
-        // Thread function takes only 1 argument. Want to pass multiple? pass a struct!	
-        err = pthread_create(&(tid[i]), NULL, &ReceiveRelay, recArgs);
-        if (err != 0) {
-            printf("can't create thread :[%s]\n", strerror(err));
-            exit(-1);
-        }
-        /*pthread_join(tid[i], NULL); Debug wait*/
-    }
-    
-    for (i = 0; i < RELAYLINES; i++) {
-        pthread_join(tid[i], NULL); //Force MessageRelays to wait for thread tid[i]. Only when thread finishes MessageRelays may continue after this point
-    }
-    pthread_mutex_destroy(&lock); //Destroy --> Free the lock after serving its purpose
-#if DEBUG
-    printf("MessageRelay returning\n");
-#endif    
-    close(sock);
-    free(recArgs);
-    return;
-}
-
-void *ReceiveRelay(void *recArgs) {
-    int bytesRcvd = 0; /* Bytes read in single recv() */
-    int totalBytesRcvd = 0;
-    char recvBuffer[CHARBUFFER] = {'8'};
-    RECEIVEARGS_T args = (RECEIVEARGS_T)recArgs;
-    int sock = args->sock;
-    float *relayServerAvgRTT = args->relayServerAvgRTT;
-    int *relayServerHops = args->relayServerHops;
-    printf("(socket=%d) Initial struct contents:\nsock=%d, *relayServerAvgRTT =%d, *relayServerHops=%d\n", sock, sock, *relayServerAvgRTT, *relayServerHops);
-
-    totalBytesRcvd = 0;
-    /* Receive up to the buffer size (minus 1 to leave space for
-       a null terminator) bytes from the sender */
-    if ((bytesRcvd = recv(sock, recvBuffer, CHARBUFFER - 1, 0)) <= 0) {
-        printf("(socket=%d) recv() failed or connection closed prematurely\n", sock);
-        printf("(socket=%d) bytesRcvd=%d\n", sock, bytesRcvd);
-        printf("(socket=%d) Received: %s\n", sock, recvBuffer);
-        exit(-1);
-    }
-    totalBytesRcvd += bytesRcvd; /* Keep tally of total bytes */
-    recvBuffer[bytesRcvd] = '\0'; /* Terminate the string! */
-    printf("%s\n", recvBuffer); /* Print the echo buffer */
-
-    *relayServerAvgRTT = atof(strtok(recvBuffer, " \n"));
-    *relayServerHops = atof(strtok(NULL, " \n"));
-    
-#if DEBUG
-    printf("(socket=%d) ReceiveRelay: sock=%d, *relayServerAvgRTT=%f, *relayServerHops=%d\n", sock, sock, *relayServerAvgRTT, *relayServerHops);
-#endif
-    printf("(socket=%d) Returning\n", sock);
-    return NULL;
-}
-
-int BestAvgRTT(int *index, float serverAvgRTT, float relayAvgRTT[]) {
+/*Determine best relayIndex via AvgRTT (-1 if direct route to endServer is better), return 1 if there is tie*/
+int BestAvgRTT(int *index, int relaySize, float serverAvgRTT, float relayAvgRTT[]) {
     float min = 0.0f;
-    int i = 0;
     int tie = 0;
-    
-    printf("Args: *index= %d, serverRTT= %f, relayRTT[0]=%f\n", *index, serverAvgRTT, relayAvgRTT[0]);    
+    int i = 0;
+
+#if DEBUG
+    printf("Args: *index=%d, relaySize=%d, serverRTT=%f, relayRTT[0]=%f\n", *index, relaySize, serverAvgRTT, relayAvgRTT[0]);
+#endif
     *index = -1; /*Represents server-direct route*/
     min = serverAvgRTT;
-    i = 0;
-    while (i < RELAYLINES) {
+    for (i = 0; i < relaySize; i++) {
         if (relayAvgRTT[i] < min) {
             min = relayAvgRTT[i];
             *index = i;
@@ -592,21 +759,21 @@ int BestAvgRTT(int *index, float serverAvgRTT, float relayAvgRTT[]) {
         } else if (relayAvgRTT[i] == min) {
             tie = 1;
         }
-        i++;
     }
     return tie;
 }
 
-int BestHops(int *index, int serverHops, int relayHops[]) {
+/*Determine best relayIndex via Hops (-1 if direct route to endServer is better), return 1 if there is tie*/
+int BestHops(int *index, int relaySize, int serverHops, int relayHops[]) {
     int min = 0;
-    int i = 0;
     int tie = 0;
-    
-    printf("Args: *index= %d, serverHops= %d, relayHops[0]=%d\n", *index, serverHops, relayHops[0]);    
+    int i = 0;
+#if DEBUG
+    printf("Args: *index=%d, relaySize=%d, serverHops=%d, relayHops[0]=%d\n", *index, relaySize, serverHops, relayHops[0]);
+#endif
     *index = -1; /*Represents server-direct route*/
     min = serverHops;
-    i = 0;
-    while (i < RELAYLINES) {
+    for (i = 0; i < relaySize; i++) {
         if (relayHops[i] < min) {
             min = relayHops[i];
             *index = i;
@@ -614,8 +781,158 @@ int BestHops(int *index, int serverHops, int relayHops[]) {
         } else if (relayHops[i] == min) {
             tie = 1;
         }
-        i++;
     }
     return tie;
 }
-/*void FreeWorld(){}*/
+
+/*Download file and count download time*/
+void *DownloadFile(void *downArgs) {
+    char *fileName = NULL;
+    char *cmdArgs = NULL;
+    char *command = NULL;
+    clock_t begin;
+    clock_t end;
+    char line[4*CHARBUFFER] = {'8'};
+    
+    DOWNARGS_T args = (DOWNARGS_T)downArgs;
+    char *url = args->url;
+    float *downTime = args->downTime;
+    
+    strcpy(line, (strrchr(url, '/') + 1));
+    fileName = malloc(strlen(line) * sizeof (char) + 1);
+    strcpy(fileName, line);
+#if DEBUG
+    printf("FileName=%s\n", fileName);
+#endif
+    /*Build wget arguments*/
+    strcpy(line, "-q -O ");
+    strcat(line, fileName);
+    strcat(line, " ");
+    cmdArgs = malloc(strlen(line)*sizeof(char) + 1);
+    strcpy(cmdArgs, line);
+    
+    /*Build wget command*/
+    command = malloc((strlen("wget ")+strlen(cmdArgs)+strlen(url))*sizeof(char) + 1);
+    strcpy(command, "wget ");
+    strcat(command, cmdArgs);
+    strcat(command,url);
+    printf("%s\n", command);
+    begin = clock();
+    system(command);
+    end = clock();
+    *downTime = (float)(end - begin)/CLOCKS_PER_SEC;
+    
+    /*Free*/
+    free(fileName); fileName = NULL;
+    free(cmdArgs); cmdArgs = NULL;
+    free(command); command = NULL;
+#if DEBUG
+    printf("DownloadFile: %s, returns: %f\n", url, *downTime);
+#endif
+    return NULL;
+}
+
+/*Download file from relay and count download time*/
+void *DownloadRelay(void *downRArgs) {
+    FILE *downFile = NULL;
+    char *fileName = NULL;
+    int fileSize = 0;
+    int bytesRec = 0;
+    int totalBytesRec = 0;
+    int sock = -1;
+    char *message = NULL;
+    int messageL = 0;
+    clock_t begin;
+    clock_t end;
+    char buf[3*FILEBUFFER] = {'8'};
+    struct sockaddr_in ServAddr; /* server address */
+     
+    DOWNARGS_T args = (DOWNARGS_T) downRArgs;
+    char *relayIP = args->relayIP;
+    char *relayPort = args->relayPort;
+    char *url = args->url;
+    float *downTime = args->downTime;
+
+    strcpy(buf, (strrchr(url, '/') + 1));
+    fileName = malloc(strlen(buf) * sizeof (char) + 1);
+    strcpy(fileName, buf);
+#if DEBUG
+    printf("FileName=%s\n", fileName);
+#endif
+    
+    strcpy(buf, "d ");
+    strcat(buf, url);
+    messageL = strlen(buf);
+    message = malloc(messageL * sizeof (char) + 1);
+    strcpy(message, buf);
+#if DEBUG
+    printf("message=%s, messageLength=%d\n", message, messageL);
+#endif
+    /* Create a reliable, stream socket using TCP */
+    if ((sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
+        printf("socket() failed\n");
+        exit(-1);
+    }
+#if DEBUG
+    printf("Sock=%d Created\n", sock);
+#endif
+    /* Construct the server address structure */
+    memset(&ServAddr, 0, sizeof (ServAddr)); /* Zero out structure */
+    ServAddr.sin_family = AF_INET; /* Internet address family */
+    ServAddr.sin_addr.s_addr = inet_addr(relayIP); /* Relay_Server IP address */
+    ServAddr.sin_port = htons((unsigned short) atoi(relayPort)); /* Relay_Server port */
+    /* Establish the connection to the echo server */
+    if (connect(sock, (struct sockaddr *) &ServAddr, sizeof (ServAddr)) < 0) {
+        printf("Sock=%d connect() failed\n", sock);
+        exit(-1);
+    }
+#if DEBUG
+    printf("Sock=%d Connected\n", sock);
+#endif
+    if (send(sock, message, messageL, 0) != messageL) {
+        printf("(socket==%d)send() sent a different number of bytes than expected\n", sock);
+    }
+#if DEBUG
+    printf("Sock=%d Message Sent\n", sock);
+#endif
+    /* Receive up to the buffer size (minus 1 to leave space for
+       a null terminator) bytes from the sender */
+    begin = clock();
+    if ((bytesRec = recv(sock, buf, FILEBUFFER, 0)) <= 0) {
+        printf("(socket=%d) recv() failed or connection closed prematurely\n", sock);
+        exit(-1);
+    }
+    fileSize = atoi(buf);
+    printf("FileSize= %d bytes\n", fileSize);
+    
+    downFile = fopen(fileName, "w");
+    if (downFile == NULL) {
+        printf("Failed to open %s\n", fileName);
+    }
+    totalBytesRec = 0;
+    while (totalBytesRec < fileSize) {
+        
+        memset(buf ,0 , FILEBUFFER);  //clear the buffer
+        /* Receive up to the buffer size */
+        if ((bytesRec = recv(sock, buf, FILEBUFFER, 0)) <= 0) {
+            printf("(socket=%d) recv() failed or connection closed prematurely\n", sock);
+            fclose(downFile);
+            exit(-1);
+        }
+        fwrite(buf, sizeof (char), bytesRec, downFile);
+        totalBytesRec += bytesRec; /* Keep tally of total bytes */
+        printf("Received %d / %d bytes\n", totalBytesRec, fileSize);
+    }
+    
+    fclose(downFile);
+    end = clock();
+    *downTime = (float) (end - begin) / CLOCKS_PER_SEC;
+#if DEBUG
+    printf("(socket=%d) Returning\n", sock);
+#endif
+    close(sock);
+    /*Free*/
+    free(message); message = NULL;
+    free(fileName); fileName = NULL;
+    return NULL;
+}
