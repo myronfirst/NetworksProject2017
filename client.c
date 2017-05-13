@@ -11,10 +11,40 @@
 #include<fcntl.h>
 #include "ThreadStructs.h"
 
+
+#define COLOR_RED     "\x1b[31m"
+#define COLOR_GREEN   "\x1b[32m"
+#define COLOR_YELLOW  "\x1b[33m"
+#define COLOR_BLUE    "\x1b[34m"
+#define COLOR_MAGENTA "\x1b[35m"
+#define COLOR_CYAN    "\x1b[36m"
+#define COLOR_RESET   "\x1b[0m"
+
+#define EXECUTABLE_NAME   "input control.exe"
+#define NO_OF_HOPS   30
+#define TIMEOUT_DELAY   20
+
+/*Stores the command line arguments*/
+struct clArgs {
+        int hops;
+        int timeout;
+        char endServers[65];
+		char relayNodes[65];
+    };
+typedef struct clArgs CMDARGS_S;
+typedef struct clArgs* CMDARGS_T;
+
 #define DEBUG 0
 #define CHARBUFFER 32
 #define FILEBUFFER 1024
-
+/*Reads Command line arguments and stores them in a clArgs(CMDARGS) struct*/
+void ReadArgs(int argc, char* argv[], CMDARGS_T args);
+/*Prints the correct syntax of the command line arguments*/
+void PrintSyntax(){
+	printf ("Correct syntax is:\tEXECUTABLE_NAME (-e <end servers filename>) (-r <relay nodes filename>) [-h <Max number of hops>] [-w <timeout delay>]\n");
+	printf ("Arguments in \'()\' are mandatory, arguments in \'[]\' are optional.\n");
+	printf ("(Default max number of hops: %d. Default timeout delay: %d sec\n", NO_OF_HOPS, TIMEOUT_DELAY);
+}
 /*Reads end_servers.txt and returns user selected endServerDomain*/
 char *ReadServers(char* sourceFile, char *userAlias);
 /*Reads relay_nodes.txt and returns number of relay_nodes*/
@@ -82,11 +112,10 @@ int main(int argc, char* argv[]) {
     char url[5*CHARBUFFER]  = {'8'};
     int i = 0; int j = 0;
     
-    /*Check arguments*/
-    if (argc < 2) {
-        printf("Not enough arguments\n");
-        exit(-1);
-    }
+    CMDARGS_T args = malloc(sizeof(CMDARGS_S));
+	
+    /*Read & Check arguments*/
+	ReadArgs(argc, argv, args);
     
     /*Take user input*/
     printf("Give input: SERVERALIAS NUMPING CRITERION\n");
@@ -107,7 +136,7 @@ int main(int argc, char* argv[]) {
     printf("%s, %s, %s\n", userAlias, numPing, criterion);
 #endif
     /*Save end_Server Domain and Alias*/
-    endServerDomain = ReadServers(argv[1], userAlias);
+    endServerDomain = ReadServers(args->endServers, userAlias);
     endServerAlias = userAlias;
 #if DEBUG    
     printf("endServerAlias=%s\n", endServerAlias);
@@ -115,7 +144,7 @@ int main(int argc, char* argv[]) {
 #endif
     
     /*Save relay_Servers Alias, IP, Port*/
-    relaySize = ReadRelays(argv[2], &relayAlias, &relayIP, &relayPort);
+    relaySize = ReadRelays(args->relayNodes, &relayAlias, &relayIP, &relayPort);
 #if DEBUG
     printf("RelaySize=%d\n", relaySize);
 
